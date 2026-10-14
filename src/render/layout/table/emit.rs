@@ -332,7 +332,7 @@ fn emit_one_row(
         }
     }
 
-    cursor.y += mr.height + mr.border_gap_below;
+    cursor.y += mr.height + band_below;
 }
 
 /// §17.4.84: the height a cell's own box effectively spans — a
