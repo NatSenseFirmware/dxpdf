@@ -28,7 +28,7 @@ use borders::{emit_table_outline, rasterize_border_grid};
 use emit::{emit_split_row, emit_table_rows, SliceCursor, TableCommandBuffers};
 use grid::{build_row_groups, row_group_end};
 use measure::measure_table_rows;
-use split::{find_row_cut, split_row_at, RowCutInput};
+use split::{find_forced_row_cut, find_row_cut, split_row_at, RowCutInput};
 
 /// Measure the first atomic paginator row group without emitting table commands.
 ///
@@ -438,43 +438,107 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 }
                 continue;
             }
+            
         }
 
-        // No split possible — move the whole group to the next page, but only
-        // if the next page is actually roomier than what is left here.
+        // No split possible under normal constraints — try again ignoring
+        // §17.3.1.14 keepLines / §17.3.1.44 widow / §17.3.1.15 keepNext.
         //
-        // A group taller than a whole page never fits anywhere. Advancing
-        // unconditionally then abandons `current_slice` while it is still
-        // empty — the caller turns that empty leading slice into a page push,
-        // so a table starting at the top of a page emitted a **blank page**
-        // and the group overflowed the next one just the same (the warning
-        // below fired either way). Same shape as the E4c floating-table
-        // spillover: acting on a condition the action cannot change.
+        // Only when the row genuinely cannot fit on any page. If it would fit on a
+        // fresh page, moving there is the correct outcome and the keep constraints
+        // are satisfiable. A row taller than `page_height_for_slice(..)` cannot be
+        // satisfied by any page, so the constraints are unenforceable and the
+        // engine must fall back to splitting rather than overflow.
         //
-        // Comparing against the *post-header* room is what makes this exact —
-        // repeating headers can leave a fresh page with less usable space than
-        // the current one, and in that case staying put overflows by less.
-        // `slices.len() + 1` because this decision happens *before* the push
-        // that would append the current slice — the index being queried is the
-        // page the group would move onto, not the one it is leaving.
+        // §17.4.6 `cantSplit` and vMerge spans are deliberately *not* relaxed here:
+        // both are OOXML-level structural claims that the row/span is atomic, not
+        // layout preferences. A `cantSplit` row taller than a page is malformed
+        // input, and Word still overflows it.
         let next_page_height = page_height_for_slice(slices.len() + 1);
         let next_remaining = if !is_header && header_count > 0 {
             next_page_height - header_height
         } else {
             next_page_height
         };
-        if next_remaining > remaining {
-            slices.push(std::mem::take(&mut current_slice));
-            remaining = next_page_height;
-            // §17.4.49: prepend the repeating header rows only when this group
-            // sits past the headers. When advancing because a header row itself
-            // doesn't fit, the row is part of the table's first appearance —
-            // emitting `Range(0..header_count)` here would duplicate it.
-            if !is_header && header_count > 0 {
-                current_slice.push(SliceItem::Range(0..header_count));
-                remaining -= header_height;
+        let fits_nowhere = !is_header
+            && group.splittable
+            && group.end - group.start == 1
+            && group.height > next_remaining;
+
+        if fits_nowhere {
+            let row_idx = group.start;
+            let forced_input = RowCutInput {
+                mr: &measured.rows[row_idx],
+                row: &rows[row_idx],
+                available: remaining,
+            };
+            if let Some(cut) = find_forced_row_cut(&forced_input) {
+                let parts = split_row_at(&measured.rows[row_idx], &cut);
+                current_slice.push(SliceItem::Split {
+                    row_idx,
+                    mr: parts.first,
+                });
+                slices.push(std::mem::take(&mut current_slice));
+                remaining = page_height_for_slice(slices.len());
+                if header_count > 0 {
+                    current_slice.push(SliceItem::Range(0..header_count));
+                    remaining -= header_height;
+                }
+                // Same iterative continuation loop as the normal split path.
+                let mut pending = parts.second;
+                loop {
+                    if pending.height <= remaining {
+                        remaining -= pending.height;
+                        current_slice.push(SliceItem::Continuation { row_idx, mr: pending });
+                        break;
+                    }
+                    let sub_cut_input = RowCutInput {
+                        mr: &pending,
+                        row: &rows[row_idx],
+                        available: remaining,
+                    };
+                    let sub_cut = find_row_cut(&sub_cut_input)
+                        .or_else(|| find_forced_row_cut(&sub_cut_input));
+                    match sub_cut {
+                        Some(sub) => {
+                            let sub_parts = split_row_at(&pending, &sub);
+                            current_slice.push(SliceItem::Continuation {
+                                row_idx,
+                                mr: sub_parts.first,
+                            });
+                            slices.push(std::mem::take(&mut current_slice));
+                            remaining = page_height_for_slice(slices.len());
+                            if header_count > 0 {
+                                current_slice.push(SliceItem::Range(0..header_count));
+                                remaining -= header_height;
+                            }
+                            pending = sub_parts.second;
+                        }
+                        None => {
+                            // Nothing splittable even relaxed — genuine
+                            // unsplittable content (a single image taller than
+                            // any page, e.g.). Warn and overflow.
+                            log::warn!(
+                                "[table] row {} continuation ({:.1}pt) is not \
+                                splittable even under relaxed keep constraints \
+                                ({:.1}pt available)",
+                                row_idx,
+                                pending.height.raw(),
+                                remaining.raw(),
+                            );
+                            current_slice.push(SliceItem::Continuation {
+                                row_idx,
+                                mr: pending,
+                            });
+                            break;
+                        }
+                    }
+                }
+                continue;
             }
         }
+
+ 
         if group.height > remaining {
             log::warn!(
                 "[table] row group {}-{} ({:.1}pt) exceeds page height ({:.1}pt available)",

@@ -88,13 +88,16 @@ pub(super) struct SplitCut {
 /// `CellCut::KeepAll`) would itself overflow `available` — in both cases
 /// the caller spills the whole row to the next page instead.
 pub(super) fn find_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
+    find_row_cut_inner(input, false)
+}
+
+pub(super) fn find_forced_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
+    find_row_cut_inner(input, true)
+}
+fn find_row_cut_inner(input: &RowCutInput<'_>, relaxed: bool) -> Option<SplitCut> {
     let mut cells: Vec<CellCut> = Vec::with_capacity(input.row.cells.len());
     let mut first_half_height = Pt::ZERO;
     let mut any_fits = false;
-    // Cells that can't be split text-wise (too few baselines or
-    // image/shape-only cells) force the row to leave room for their full
-    // visible height on the first half; otherwise their content (image,
-    // path, etc.) would overflow the cut-edge border.
     let mut non_splittable_heights: Vec<Pt> = Vec::with_capacity(input.row.cells.len());
 
     for (entry, cell) in input.mr.entries.iter().zip(&input.row.cells) {
@@ -103,6 +106,7 @@ pub(super) fn find_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
             cell.margins.top,
             cell.margins.bottom,
             input.available,
+            relaxed,
         ) {
             Some((cut, half_h)) => {
                 any_fits = true;
@@ -114,10 +118,8 @@ pub(super) fn find_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
             }
             None => {
                 cells.push(CellCut::KeepAll);
-                // Cell's natural visible height (content + vertical margins)
-                // must fit on the first half — we can't cut through an
-                // image or shape.
-                let required = entry.layout.content_height + cell.margins.top + cell.margins.bottom;
+                let required =
+                    entry.layout.content_height + cell.margins.top + cell.margins.bottom;
                 non_splittable_heights.push(required);
             }
         }
@@ -127,9 +129,6 @@ pub(super) fn find_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
         return None;
     }
 
-    // Raise first_half_height so every non-splittable cell fits. If that
-    // exceeds `available`, splitting isn't safe — caller should spill the
-    // whole row to the next page.
     let non_splittable_max = non_splittable_heights
         .iter()
         .copied()
@@ -145,7 +144,6 @@ pub(super) fn find_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
         cells,
     })
 }
-
 /// For a single cell, choose the largest legal prefix of lines that fits in
 /// `available`, honoring the cell paragraphs' §17.3.1.14 keepLines,
 /// §17.3.1.44 widow/orphan control, and §17.3.1.15 keepNext — the same policy
@@ -162,6 +160,7 @@ fn cut_for_cell(
     margin_top: Pt,
     margin_bottom: Pt,
     available: Pt,
+    relaxed: bool,     
 ) -> Option<(CellCut, Pt)> {
     // Space available for the content between both margins, since the first
     // half reproduces the cell's natural layout (top margin, retained lines,
@@ -171,7 +170,11 @@ fn cut_for_cell(
         return None;
     }
 
-    let cont_top = largest_legal_cut(&entry.layout.lines, budget)?;
+    let cont_top = if relaxed {
+        largest_forced_cut(&entry.layout.lines, budget)?
+    } else {
+        largest_legal_cut(&entry.layout.lines, budget)?
+    };
     // Load-bearing for **termination**, not tidiness.
     //
     // `cont_top` becomes this cell's `shift`, and `split_row_at` derives
@@ -223,7 +226,21 @@ fn cut_for_cell(
 ///
 /// Line box tops increase monotonically, so the scan stops once a candidate
 /// exceeds `budget`.
+/// 现有语义：遵守所有 keep 约束。
 fn largest_legal_cut(lines: &[CellLine], budget: Pt) -> Option<Pt> {
+    largest_cut_inner(lines, budget, false)
+}
+
+/// 强制模式：忽略 §17.3.1.14 keepLines、§17.3.1.44 widow/orphan、
+/// §17.3.1.15 keepNext。
+///
+/// 用于一行/一组比整页还高的情况——这些约束此时无法满足，
+/// 硬塞只会溢出页面，拆分是唯一合法结果。
+fn largest_forced_cut(lines: &[CellLine], budget: Pt) -> Option<Pt> {
+    largest_cut_inner(lines, budget, true)
+}
+
+fn largest_cut_inner(lines: &[CellLine], budget: Pt, relaxed: bool) -> Option<Pt> {
     let n = lines.len();
     if n < 2 {
         return None;
@@ -237,19 +254,19 @@ fn largest_legal_cut(lines: &[CellLine], budget: Pt) -> Option<Pt> {
             break;
         }
         let legal = if a.para == b.para {
-            if a.interior_atomic {
+            if a.interior_atomic && !relaxed {
                 false
-            } else if a.widow_control {
+            } else if a.widow_control && !relaxed {
                 let first = lines.iter().position(|x| x.para == a.para).unwrap_or(l);
                 let last = lines.iter().rposition(|x| x.para == a.para).unwrap_or(l);
-                let head = l + 1 - first; // this paragraph's lines kept
-                let tail = last - l; // this paragraph's lines continued
+                let head = l + 1 - first;
+                let tail = last - l;
                 head >= 2 && tail >= 2
             } else {
                 true
             }
         } else {
-            !a.keep_next
+            !a.keep_next || relaxed
         };
         if legal {
             best = Some(best.map_or(cont_top, |x: Pt| x.max(cont_top)));
@@ -257,7 +274,6 @@ fn largest_legal_cut(lines: &[CellLine], budget: Pt) -> Option<Pt> {
     }
     best
 }
-
 /// A row cut into two halves. Each half is a full `MeasuredRow` ready to
 /// pass to `emit_one_row`.
 pub(super) struct SplitRow {
@@ -689,7 +705,7 @@ mod tests {
             content_dx: Pt::ZERO,
         };
         assert!(
-            cut_for_cell(&entry, Pt::ZERO, Pt::ZERO, Pt::new(100.0)).is_none(),
+            cut_for_cell(&entry, Pt::ZERO, Pt::ZERO, Pt::new(100.0), false).is_none(),
             "a zero-offset cut must be rejected - accepting it gives shift == 0 \
              and the continuation loop never progresses"
         );
