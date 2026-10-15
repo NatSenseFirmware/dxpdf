@@ -345,9 +345,8 @@ pub(crate) fn layout_table_paginated_with_page_heights(
     let mut remaining = available_height;
 
     // === 改為 Peekable 迭代器，支援放回 group 重處理 ===
-    use std::iter::Peekable;
-    let mut groups_iter = groups.iter().peekable();
-    const BOTTOM_QUARTER_RATIO: f64 = 0.25;
+    let mut buffered: Option<RowGroup> = None;
+    const BOTTOM_QUARTER_RATIO: f32 = 0.25;
 
     while let Some(group) = groups_iter.next() {
         log::debug!(
@@ -403,7 +402,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 remaining -= group.height;
                 continue;
             } else {
-                // ❌ 下一頁放不下整組：開新頁，group放回迭代器，下一輪在新頁做split
+            // ❌ 下一頁放不下整組：開新頁，group放回緩衝，下一輪在新頁做split
                 log::debug!(
                     "[table-paginate] group {}-{} cannot fit fully on next page. flip page, reprocess group on new page for split",
                     group.start,
@@ -415,8 +414,8 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                     current_slice.push(SliceItem::Range(0..header_count));
                     remaining -= header_height;
                 }
-                // 放回 group，下一次 while 重新處理這個 group
-                groups_iter.put_back(group);
+                // 重點：把當前 group 放回緩衝，下一輪 loop 會重新讀取
+                buffered = Some(group);
                 continue;
             }
         }
