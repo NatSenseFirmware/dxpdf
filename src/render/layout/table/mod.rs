@@ -318,7 +318,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             size: PtSize::ZERO,
         }];
     }
-
     let measured = measure_table_rows(
         rows,
         col_widths,
@@ -328,7 +327,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         measure_text,
         suppress_first_row_top,
     );
-
     // §17.4.49: contiguous header rows from index 0.
     let header_count = rows
         .iter()
@@ -338,9 +336,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         .iter()
         .map(|mr| mr.height + mr.border_gap_below)
         .sum();
-
     let groups = build_row_groups(rows, &measured);
-
     // Each slice is a list of items to emit in order: either a range of
     // measured rows (the common case) or a custom (split) row with its own
     // MeasuredRow data.
@@ -348,18 +344,89 @@ pub(crate) fn layout_table_paginated_with_page_heights(
     let mut current_slice: Vec<SliceItem> = Vec::new();
     let mut remaining = available_height;
 
-    for group in &groups {
+    // === 改為 Peekable 迭代器，支援放回 group 重處理 ===
+    use std::iter::Peekable;
+    let mut groups_iter = groups.iter().peekable();
+    const BOTTOM_QUARTER_RATIO: f64 = 0.25;
+
+    while let Some(group) = groups_iter.next() {
+        log::debug!(
+            "[table-paginate] processing group {}-{} group_h={:.1}pt remaining={:.1}pt",
+            group.start,
+            group.end,
+            group.height.raw(),
+            remaining.raw()
+        );
         if group.height <= remaining {
             current_slice.push(SliceItem::Range(group.start..group.end));
             remaining -= group.height;
             continue;
         }
 
+        // ========== 新增：頁底1/4保護區邏輯 ==========
+        let current_slice_index = slices.len();
+        let current_page_total_height = page_height_for_slice(current_slice_index);
+        let bottom_quarter_threshold = current_page_total_height * BOTTOM_QUARTER_RATIO;
+        let is_header = group.start < header_count;
+
+        // 只有非表頭、且剩餘空間落在頁面底部1/4區域才觸發保護規則
+        if !is_header && remaining < bottom_quarter_threshold {
+            log::debug!(
+                "[table-paginate] group {}-{} hit bottom quarter protect zone. remaining={:.1} < threshold={:.1}",
+                group.start,
+                group.end,
+                remaining.raw(),
+                bottom_quarter_threshold.raw()
+            );
+            let next_page_idx = slices.len() + 1;
+            let next_page_total = page_height_for_slice(next_page_idx);
+            let next_page_remaining = if header_count > 0 {
+                next_page_total - header_height
+            } else {
+                next_page_total
+            };
+
+            if group.height <= next_page_remaining {
+                // ✅ 下一頁可以完整放下整個group：直接開新頁，完全跳過拆分邏輯
+                log::debug!(
+                    "[table-paginate] group {}-{} fits fully on next page, move whole group to new page",
+                    group.start,
+                    group.end
+                );
+                slices.push(std::mem::take(&mut current_slice));
+                remaining = page_height_for_slice(slices.len());
+                if header_count > 0 {
+                    current_slice.push(SliceItem::Range(0..header_count));
+                    remaining -= header_height;
+                }
+                current_slice.push(SliceItem::Range(group.start..group.end));
+                remaining -= group.height;
+                continue;
+            } else {
+                // ❌ 下一頁放不下整組：開新頁，group放回迭代器，下一輪在新頁做split
+                log::debug!(
+                    "[table-paginate] group {}-{} cannot fit fully on next page. flip page, reprocess group on new page for split",
+                    group.start,
+                    group.end
+                );
+                slices.push(std::mem::take(&mut current_slice));
+                remaining = page_height_for_slice(slices.len());
+                if header_count > 0 {
+                    current_slice.push(SliceItem::Range(0..header_count));
+                    remaining -= header_height;
+                }
+                // 放回 group，下一次 while 重新處理這個 group
+                groups_iter.put_back(group);
+                continue;
+            }
+        }
+        // ========== 新增保護區邏輯結束，往下走原有拆分邏輯 ==========
+
         // §17.4.49: header rows are atomic with respect to splitting — they
         // must remain intact so the same row content can repeat verbatim on
         // continuation slices. Non-header rows fall through to the normal
         // §17.4.6 split path.
-        let is_header = group.start < header_count;
+        // let is_header = group.start < header_count; // 上面已經定義過
 
         // Doesn't fit. Try to split (§17.4.6) before spilling the whole
         // group to the next page. Only non-header single-row groups are
@@ -384,7 +451,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                     current_slice.push(SliceItem::Range(0..header_count));
                     remaining -= header_height;
                 }
-
                 // Iteratively place the continuation, splitting again each
                 // time it exceeds the new page's remaining space.
                 let mut pending = parts.second;
@@ -438,7 +504,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 }
                 continue;
             }
-            
         }
 
         // No split possible under normal constraints — try again ignoring
@@ -464,7 +529,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             && group.splittable
             && group.end - group.start == 1
             && group.height > next_remaining;
-
         if fits_nowhere {
             let row_idx = group.start;
             let forced_input = RowCutInput {
@@ -520,8 +584,8 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                             // any page, e.g.). Warn and overflow.
                             log::warn!(
                                 "[table] row {} continuation ({:.1}pt) is not \
-                                splittable even under relaxed keep constraints \
-                                ({:.1}pt available)",
+                                 splittable even under relaxed keep constraints \
+                                 ({:.1}pt available)",
                                 row_idx,
                                 pending.height.raw(),
                                 remaining.raw(),
@@ -538,7 +602,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             }
         }
 
- 
         if group.height > remaining {
             log::warn!(
                 "[table] row group {}-{} ({:.1}pt) exceeds page height ({:.1}pt available)",
@@ -551,13 +614,12 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         current_slice.push(SliceItem::Range(group.start..group.end));
         remaining -= group.height;
     }
-    slices.push(current_slice);
 
+    slices.push(current_slice);
     // §17.4.38: the table's outer top border, used to restore the top edge
     // on continuation page slices where border conflict resolution or adjacent
     // table collapse removed it.
     let outer_top_border = borders.and_then(|b| b.top);
-
     // Emit draw commands for each slice.
     let last_slice_idx = slices.len().saturating_sub(1);
     slices
@@ -617,6 +679,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         })
         .collect()
 }
+
 
 /// One item inside a page slice's emit list.
 enum SliceItem {
