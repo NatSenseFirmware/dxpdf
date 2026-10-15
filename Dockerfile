@@ -1,4 +1,4 @@
-FROM rust:1.80-slim
+FROM rust:1.94-slim
 
 # 安裝打包 deb 必要的系統套件
 RUN apt-get update && apt-get install -y \

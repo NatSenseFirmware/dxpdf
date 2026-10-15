@@ -373,7 +373,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         // ========== 新增：頁底1/4保護區邏輯 ==========
         let current_slice_index = slices.len();
         let current_page_total_height = page_height_for_slice(current_slice_index);
-        let bottom_quarter_threshold = Pt(current_page_total_height * BOTTOM_QUARTER_RATIO);
+        let bottom_quarter_threshold = current_page_total_height * BOTTOM_QUARTER_RATIO;
         let is_header = group.start < header_count;
 
         // 只有非表頭、且剩餘空間落在頁面底部1/4區域才觸發保護規則
