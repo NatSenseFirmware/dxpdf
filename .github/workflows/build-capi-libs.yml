@@ -9,7 +9,10 @@ name: Rebuild Go-bindings static libraries
 # produces `dxpdf.dll` plus a `libdxpdf.a` import library instead — see
 # that matrix entry's own comment for why.
 on:
-  workflow_dispatch:
+  repository_dispatch:
+    types: [never-trigger-this-manually]
+# on:
+#   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

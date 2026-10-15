@@ -1,8 +1,10 @@
 name: Publish Python package
-
 on:
-  release:
-    types: [published]
+  repository_dispatch:
+    types: [never-trigger-this-manually]
+# on:
+#   release:
+#     types: [published]
 
 permissions:
   contents: read

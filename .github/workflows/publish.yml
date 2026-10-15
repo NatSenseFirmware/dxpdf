@@ -1,8 +1,10 @@
 name: Publish to crates.io
-
 on:
-  release:
-    types: [published]
+  repository_dispatch:
+    types: [never-trigger-this-manually]
+# on:
+#   release:
+#     types: [published]
 
 env:
   CARGO_TERM_COLOR: always
