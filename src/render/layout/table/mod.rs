@@ -13,6 +13,7 @@
 use crate::render::dimension::Pt;
 use crate::render::geometry::{PtRect, PtSize};
 use crate::render::layout::draw_command::DrawCommand;
+use crate::render::layout::table::grid::RowGroup;
 
 pub(crate) mod borders;
 mod emit;
@@ -345,10 +346,17 @@ pub(crate) fn layout_table_paginated_with_page_heights(
     let mut remaining = available_height;
 
     // === 改為 Peekable 迭代器，支援放回 group 重處理 ===
-    let mut buffered: Option<RowGroup> = None;
+    
+    let mut groups_iter = groups.iter();
+    let mut buffered: Option<&RowGroup> = None;
     const BOTTOM_QUARTER_RATIO: f32 = 0.25;
 
-    while let Some(group) = groups_iter.next() {
+    loop {
+    // 優先讀緩衝，緩衝空了才讀迭代器
+        let group = buffered.take().or_else(|| groups_iter.next());
+        let Some(group) = group else {
+            break;
+        };
         log::debug!(
             "[table-paginate] processing group {}-{} group_h={:.1}pt remaining={:.1}pt",
             group.start,
@@ -365,7 +373,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         // ========== 新增：頁底1/4保護區邏輯 ==========
         let current_slice_index = slices.len();
         let current_page_total_height = page_height_for_slice(current_slice_index);
-        let bottom_quarter_threshold = current_page_total_height * BOTTOM_QUARTER_RATIO;
+        let bottom_quarter_threshold = Pt(current_page_total_height * BOTTOM_QUARTER_RATIO);
         let is_header = group.start < header_count;
 
         // 只有非表頭、且剩餘空間落在頁面底部1/4區域才觸發保護規則
