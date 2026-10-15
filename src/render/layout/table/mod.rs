@@ -318,6 +318,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             size: PtSize::ZERO,
         }];
     }
+
     let measured = measure_table_rows(
         rows,
         col_widths,
@@ -327,6 +328,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         measure_text,
         suppress_first_row_top,
     );
+
     // §17.4.49: contiguous header rows from index 0.
     let header_count = rows
         .iter()
@@ -336,38 +338,29 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         .iter()
         .map(|mr| mr.height + mr.border_gap_below)
         .sum();
+
     let groups = build_row_groups(rows, &measured);
+
     // Each slice is a list of items to emit in order: either a range of
     // measured rows (the common case) or a custom (split) row with its own
     // MeasuredRow data.
     let mut slices: Vec<Vec<SliceItem>> = Vec::new();
     let mut current_slice: Vec<SliceItem> = Vec::new();
     let mut remaining = available_height;
+
     for group in &groups {
-        log::debug!(
-            "[table-paginate] processing group {}-{} group_h={:.1}pt remaining={:.1}pt",
-            group.start,
-            group.end,
-            group.height.raw(),
-            remaining.raw()
-        );
         if group.height <= remaining {
             current_slice.push(SliceItem::Range(group.start..group.end));
             remaining -= group.height;
-            log::debug!(
-                "[table-paginate] group {}-{} fit on current slice, new remaining={:.1}pt",
-                group.start,
-                group.end,
-                remaining.raw()
-            );
             continue;
         }
+
         // §17.4.49: header rows are atomic with respect to splitting — they
         // must remain intact so the same row content can repeat verbatim on
         // continuation slices. Non-header rows fall through to the normal
         // §17.4.6 split path.
         let is_header = group.start < header_count;
-        let mut split_success: bool = false;
+
         // Doesn't fit. Try to split (§17.4.6) before spilling the whole
         // group to the next page. Only non-header single-row groups are
         // splittable — vMerge spans and cantSplit rows set `splittable=false`.
@@ -379,12 +372,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 available: remaining,
             };
             if let Some(cut) = find_row_cut(&cut_input) {
-                log::debug!(
-                    "[table-paginate] group {}-{} normal split found, row_idx={}",
-                    group.start,
-                    group.end,
-                    row_idx
-                );
                 let parts = split_row_at(&measured.rows[row_idx], &cut);
                 current_slice.push(SliceItem::Split {
                     row_idx,
@@ -397,6 +384,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                     current_slice.push(SliceItem::Range(0..header_count));
                     remaining -= header_height;
                 }
+
                 // Iteratively place the continuation, splitting again each
                 // time it exceeds the new page's remaining space.
                 let mut pending = parts.second;
@@ -407,11 +395,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                             row_idx,
                             mr: pending,
                         });
-                        log::debug!(
-                            "[table-paginate] row {} continuation fit remaining={:.1}",
-                            row_idx,
-                            remaining.raw()
-                        );
                         break;
                     }
                     let sub_cut_input = RowCutInput {
@@ -421,10 +404,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                     };
                     match find_row_cut(&sub_cut_input) {
                         Some(sub_cut) => {
-                            log::debug!(
-                                "[table-paginate] row {} continuation sub-split",
-                                row_idx
-                            );
                             let sub = split_row_at(&pending, &sub_cut);
                             current_slice.push(SliceItem::Continuation {
                                 row_idx,
@@ -457,9 +436,9 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                         }
                     }
                 }
-                split_success = true;
                 continue;
             }
+            
         }
 
         // No split possible under normal constraints — try again ignoring
@@ -485,6 +464,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             && group.splittable
             && group.end - group.start == 1
             && group.height > next_remaining;
+
         if fits_nowhere {
             let row_idx = group.start;
             let forced_input = RowCutInput {
@@ -493,12 +473,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 available: remaining,
             };
             if let Some(cut) = find_forced_row_cut(&forced_input) {
-                log::debug!(
-                    "[table-paginate] group {}-{} forced split activated row_idx={}",
-                    group.start,
-                    group.end,
-                    row_idx
-                );
                 let parts = split_row_at(&measured.rows[row_idx], &cut);
                 current_slice.push(SliceItem::Split {
                     row_idx,
@@ -516,11 +490,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                     if pending.height <= remaining {
                         remaining -= pending.height;
                         current_slice.push(SliceItem::Continuation { row_idx, mr: pending });
-                        log::debug!(
-                            "[table-paginate] forced split row {} continuation fit remaining={:.1}",
-                            row_idx,
-                            remaining.raw()
-                        );
                         break;
                     }
                     let sub_cut_input = RowCutInput {
@@ -532,10 +501,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                         .or_else(|| find_forced_row_cut(&sub_cut_input));
                     match sub_cut {
                         Some(sub) => {
-                            log::debug!(
-                                "[table-paginate] forced split row {} sub-cut",
-                                row_idx
-                            );
                             let sub_parts = split_row_at(&pending, &sub);
                             current_slice.push(SliceItem::Continuation {
                                 row_idx,
@@ -555,8 +520,8 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                             // any page, e.g.). Warn and overflow.
                             log::warn!(
                                 "[table] row {} continuation ({:.1}pt) is not \
-                                 splittable even under relaxed keep constraints \
-                                 ({:.1}pt available)",
+                                splittable even under relaxed keep constraints \
+                                ({:.1}pt available)",
                                 row_idx,
                                 pending.height.raw(),
                                 remaining.raw(),
@@ -569,53 +534,12 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                         }
                     }
                 }
-                split_success = true;
                 continue;
             }
         }
 
-        // ===================== 新增：拆分失败后，判断下一页能否完整放下group =====================
-        if !split_success {
-            let next_page_h = page_height_for_slice(slices.len());
-            let next_available = if header_count > 0 {
-                next_page_h - header_height
-            } else {
-                next_page_h
-            };
-            log::debug!(
-                "[table-paginate] group {}-{} split failed, check next page: group_h={:.1}, next_available={:.1}",
-                group.start,
-                group.end,
-                group.height.raw(),
-                next_available.raw()
-            );
-            if group.height <= next_available {
-                log::debug!(
-                    "[table-paginate] group {}-{} can fit fully on next page. Flush current slice, create new page",
-                    group.start,
-                    group.end
-                );
-                // 提交当前累积slice
-                slices.push(std::mem::take(&mut current_slice));
-                // 新页面总高度
-                remaining = next_page_h;
-                // 插入表头
-                if header_count > 0 {
-                    current_slice.push(SliceItem::Range(0..header_count));
-                    remaining -= header_height;
-                }
-                // 当前group放到新页面
-                current_slice.push(SliceItem::Range(group.start..group.end));
-                remaining -= group.height;
-                log::debug!(
-                    "[table-paginate] group {}-{} placed on new page, remaining={:.1}",
-                    group.start,
-                    group.end,
-                    remaining.raw()
-                );
-                continue;
-            }
-            // 下一页也放不下，维持旧逻辑：warn + 强行塞进当前页
+ 
+        if group.height > remaining {
             log::warn!(
                 "[table] row group {}-{} ({:.1}pt) exceeds page height ({:.1}pt available)",
                 group.start,
@@ -623,20 +547,17 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 group.height.raw(),
                 remaining.raw(),
             );
-            log::debug!(
-                "[table-paginate] group {}-{} cannot fit even on next page, force place on current slice",
-                group.start,
-                group.end
-            );
-            current_slice.push(SliceItem::Range(group.start..group.end));
-            remaining -= group.height;
         }
+        current_slice.push(SliceItem::Range(group.start..group.end));
+        remaining -= group.height;
     }
     slices.push(current_slice);
+
     // §17.4.38: the table's outer top border, used to restore the top edge
     // on continuation page slices where border conflict resolution or adjacent
     // table collapse removed it.
     let outer_top_border = borders.and_then(|b| b.top);
+
     // Emit draw commands for each slice.
     let last_slice_idx = slices.len().saturating_sub(1);
     slices
@@ -696,7 +617,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         })
         .collect()
 }
-
 
 /// One item inside a page slice's emit list.
 enum SliceItem {
