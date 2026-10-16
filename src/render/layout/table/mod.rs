@@ -347,9 +347,34 @@ pub(crate) fn layout_table_paginated_with_page_heights(
 
     // === 改為 Peekable 迭代器，支援放回 group 重處理 ===
     
-    let mut groups_iter = groups.iter();
+        let mut groups_iter = groups.iter();
     let mut buffered: Option<&RowGroup> = None;
+    /// A page's bottom quarter, by height.
+    ///
+    /// This bounds the "protect zone": a group that arrives with only the
+    /// bottom quarter of the page left is a candidate for being moved whole to
+    /// the next page rather than split. A ratio of the page, not a length, so a
+    /// shorter continuation page protects proportionally less.
     const BOTTOM_QUARTER_RATIO: f32 = 0.25;
+        /// How little of an oversized group may fit in the leftover space before
+    /// the protect zone still applies.
+    ///
+    /// Moving a group whole costs the `remaining` space it abandons, and buys a
+    /// page break — which a *split* would have paid for anyway. So padding only
+    /// beats splitting when at most half of the group could have stayed here:
+    /// then the split moves the majority of it regardless, and the break it
+    /// pays for is the break the protect zone is spending.
+    ///
+    /// This is what keeps a near-fit — a group that overflows by a hair while
+    /// the leftover happens to fall in the bottom quarter — out of the protect
+    /// zone. Such a group is almost entirely placeable here (`placeable` ≫
+    /// `moved`), and a normal split places it without stranding anything.
+    ///
+    /// Measured against the group, not the page. An earlier version compared
+    /// `page_height - placeable_here` against half a *page*, which for a group
+    /// slightly taller than a page is true no matter how little room is left —
+    /// so it fired on exactly the near-fit it was meant to exclude.
+    const PROTECT_ZONE_ONLY_IF_MOSTLY_UNPLACEABLE: f32 = 0.5;
 
     loop {
     // 優先讀緩衝，緩衝空了才讀迭代器
@@ -376,14 +401,24 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         let bottom_quarter_threshold = current_page_total_height * BOTTOM_QUARTER_RATIO;
         let is_header = group.start < header_count;
 
-        // 只有非表頭、且剩餘空間落在頁面底部1/4區域才觸發保護規則
-        if !is_header && remaining < bottom_quarter_threshold {
+                                // 只有非表頭、且剩餘空間落在頁面底部1/4區域，并且這一組大部分內容本来
+        // 就放不下（拆分也只能把大部分搬去下一頁），才觸發保護規則。少了第二個
+        // 條件，任何「差一點就放得下」的 group 只要剩餘空間恰好落進底部 1/4 就會
+        // 被整組推到下一頁，把本來放得下的內容一起搬走。
+        let placeable_here = group.height.min(remaining);
+        let moved_by_split = group.height - placeable_here;
+        if !is_header
+            && remaining < bottom_quarter_threshold
+            && placeable_here <= moved_by_split * PROTECT_ZONE_ONLY_IF_MOSTLY_UNPLACEABLE
+        {
             log::debug!(
-                "[table-paginate] group {}-{} hit bottom quarter protect zone. remaining={:.1} < threshold={:.1}",
+                "[table-paginate] group {}-{} hit bottom quarter protect zone. remaining={:.1} < threshold={:.1}, placeable={:.1} moved={:.1}",
                 group.start,
                 group.end,
                 remaining.raw(),
-                bottom_quarter_threshold.raw()
+                bottom_quarter_threshold.raw(),
+                placeable_here.raw(),
+                moved_by_split.raw()
             );
             let next_page_idx = slices.len() + 1;
             let next_page_total = page_height_for_slice(next_page_idx);
