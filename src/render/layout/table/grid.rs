@@ -105,7 +105,7 @@ pub(super) fn row_group_end(rows: &[TableRowInput], start: usize) -> usize {
     end
 }
 
-fn cell_has_nested_table(cell: &TableCellInput) -> bool {
+pub(super) fn cell_has_nested_table(cell: &TableCellInput) -> bool {
     use crate::render::layout::section::LayoutBlock;
     cell.blocks
         .iter()

@@ -27,7 +27,7 @@ pub use types::*;
 
 use borders::{emit_table_outline, rasterize_border_grid};
 use emit::{emit_split_row, emit_table_rows, SliceCursor, TableCommandBuffers};
-use grid::{build_row_groups, row_group_end};
+use grid::{build_row_groups, cell_has_nested_table, row_group_end};
 use measure::measure_table_rows;
 use split::{find_forced_row_cut, find_row_cut, split_row_at, RowCutInput};
 
@@ -261,7 +261,9 @@ pub(crate) struct TablePaginationHeights<F> {
 /// Lay out a table with page splitting at row boundaries.
 ///
 /// §17.4.49: header rows repeat on each continuation page.
-/// §17.4.6: `cantSplit` rows are kept together (moved to next page if needed).
+/// §17.4.6: `cantSplit` rows are kept together — moved whole to the next page
+/// when they do not fit here, and split at a line boundary only when a single
+/// row is taller than any page can hold.
 ///
 /// Returns one `TableSlice` per page.
 pub fn layout_table_paginated(
@@ -548,28 +550,53 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             }
         }
 
-        // No split possible under normal constraints — try again ignoring
-        // §17.3.1.14 keepLines / §17.3.1.44 widow / §17.3.1.15 keepNext.
-        //
-        // Only when the row genuinely cannot fit on any page. If it would fit on a
-        // fresh page, moving there is the correct outcome and the keep constraints
-        // are satisfiable. A row taller than `page_height_for_slice(..)` cannot be
-        // satisfied by any page, so the constraints are unenforceable and the
-        // engine must fall back to splitting rather than overflow.
-        //
-        // §17.4.6 `cantSplit` and vMerge spans are deliberately *not* relaxed here:
-        // both are OOXML-level structural claims that the row/span is atomic, not
-        // layout preferences. A `cantSplit` row taller than a page is malformed
-        // input, and Word still overflows it.
+        // Nothing above placed the group: it does not fit in `remaining` and was
+        // not split under the normal §17.4.6 path. That covers a `cantSplit` row,
+        // a vMerge span, a nested-table cell, and a splittable row whose content
+        // offers no legal cut. §17.4.6 forbids a *cut*, not a *move*, so the first
+        // remedy is the next page: whenever a fresh page holds the whole group, it
+        // is moved there rather than overflowing the current one.
         let next_page_height = page_height_for_slice(slices.len() + 1);
         let next_remaining = if !is_header && header_count > 0 {
             next_page_height - header_height
         } else {
             next_page_height
         };
+        if !is_header && group.height <= next_remaining {
+            log::debug!(
+                "[table-paginate] group {}-{} does not fit in {:.1}pt remaining; \
+                 moving whole to next page",
+                group.start,
+                group.end,
+                remaining.raw()
+            );
+            slices.push(std::mem::take(&mut current_slice));
+            remaining = page_height_for_slice(slices.len());
+            if header_count > 0 {
+                current_slice.push(SliceItem::Range(0..header_count));
+                remaining -= header_height;
+            }
+            current_slice.push(SliceItem::Range(group.start..group.end));
+            remaining -= group.height;
+            continue;
+        }
+
+        // The group is taller than a whole page, so moving it gains nothing and
+        // the keep-together claim is physically unsatisfiable. A single row whose
+        // content is line-shaped text is then split at a line boundary — ignoring
+        // §17.3.1.14 keepLines / §17.3.1.44 widow / §17.3.1.15 keepNext — so as
+        // much text as possible stays on each page. A `cantSplit` row is relaxed
+        // here too: it is atomic only while some page can honour that, and none
+        // can. Nested-table cells and vMerge spans are structurally indivisible
+        // and fall through to the overflow below.
+        let single_row_group = group.end - group.start == 1;
+        let row_has_nested_table = rows[group.start..group.end]
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .any(cell_has_nested_table);
         let fits_nowhere = !is_header
-            && group.splittable
-            && group.end - group.start == 1
+            && single_row_group
+            && !row_has_nested_table
             && group.height > next_remaining;
         if fits_nowhere {
             let row_idx = group.start;
@@ -603,8 +630,15 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                         row: &rows[row_idx],
                         available: remaining,
                     };
-                    let sub_cut = find_row_cut(&sub_cut_input)
-                        .or_else(|| find_forced_row_cut(&sub_cut_input));
+                    // A normally-splittable row honours keep constraints in its
+                    // continuations wherever a legal cut still exists; a
+                    // `cantSplit` row, already relaxed, keeps relaxing to
+                    // maximise how much text stays on each page.
+                    let sub_cut = if group.splittable {
+                        find_row_cut(&sub_cut_input).or_else(|| find_forced_row_cut(&sub_cut_input))
+                    } else {
+                        find_forced_row_cut(&sub_cut_input)
+                    };
                     match sub_cut {
                         Some(sub) => {
                             let sub_parts = split_row_at(&pending, &sub);
@@ -2319,14 +2353,16 @@ mod tests {
 
     // ── §17.4.6 page advance must gain space ─────────────────────────────
 
-    /// A row group taller than a whole page fits nowhere, so advancing to a
-    /// fresh page cannot help — it only abandons an empty leading slice, which
-    /// the section layer turns into a blank page.
+    /// A `cantSplit` row taller than a whole page fits nowhere, so advancing to
+    /// a fresh page cannot help — it only abandons an empty leading slice, which
+    /// the section layer turns into a blank page. The keep-together claim is
+    /// unsatisfiable, so the row is split at a line boundary instead: every
+    /// slice carries content and none is an abandoned blank page.
     ///
     /// `available_height == page_height` models the table starting at the top
     /// of a page, which is exactly when the old code emitted the blank.
     #[test]
-    fn oversized_group_at_page_top_does_not_emit_an_empty_leading_slice() {
+    fn oversized_group_at_page_top_splits_instead_of_overflowing() {
         let mut row = tall_row(20); // ≈ 280pt
         row.cant_split = Some(true);
 
@@ -2344,11 +2380,18 @@ mod tests {
             },
         );
 
-        assert_eq!(slices.len(), 1, "no page to gain, so no page to push");
         assert!(
-            !slices[0].commands.is_empty(),
-            "the single slice must carry the content, not be an abandoned empty"
+            slices.len() >= 2,
+            "a cantSplit row taller than a page is split, not overflowed"
         );
+        for slice in &slices {
+            assert!(
+                !slice.commands.is_empty(),
+                "no slice may be empty — a blank page is the defect"
+            );
+        }
+        let total_lines: usize = slices.iter().map(slice_line_count).sum();
+        assert_eq!(total_lines, 20, "all 20 lines emitted exactly once");
     }
 
     /// The converse, so the fix can't be "never advance": when the table

@@ -5,8 +5,11 @@ name: Publish Debian packages
 # different environments — this one runs inside a Debian container, that one on
 # the runner.
 on:
-  release:
-    types: [published]
+  repository_dispatch:
+    types: [never-trigger-this-manually]
+# on:
+#   release:
+#     types: [published]
 
 permissions:
   contents: read
