@@ -340,6 +340,17 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         .map(|mr| mr.height + mr.border_gap_below)
         .sum();
     let groups = build_row_groups(rows, &measured);
+    // A marker that only the current pagination logic prints: if it is absent
+    // from `RUST_LOG=debug` output the binary was not rebuilt (a stale
+    // `target/` over a Windows bind mount is the usual cause).
+    log::debug!(
+        "[table-paginate] ENTER v2: groups={} header_count={} header_h={:.1} available={:.1} page0_h={:.1}",
+        groups.len(),
+        header_count,
+        header_height.raw(),
+        available_height.raw(),
+        page_height_for_slice(0).raw(),
+    );
     // Each slice is a list of items to emit in order: either a range of
     // measured rows (the common case) or a custom (split) row with its own
     // MeasuredRow data.
@@ -562,6 +573,28 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         } else {
             next_page_height
         };
+        let single_row_group = group.end - group.start == 1;
+        let row_has_nested_table = rows[group.start..group.end]
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .any(cell_has_nested_table);
+        log::debug!(
+            "[table-paginate] group {}-{} spill decision: group_h={:.1} remaining={:.1} \
+             next_page_h={:.1} header_h={:.1} next_remaining={:.1} | is_header={} \
+             splittable={} single_row={} nested_table={} page0_h={:.1}",
+            group.start,
+            group.end,
+            group.height.raw(),
+            remaining.raw(),
+            next_page_height.raw(),
+            header_height.raw(),
+            next_remaining.raw(),
+            is_header,
+            group.splittable,
+            single_row_group,
+            row_has_nested_table,
+            page_height_for_slice(0).raw(),
+        );
         if !is_header && group.height <= next_remaining {
             log::debug!(
                 "[table-paginate] group {}-{} does not fit in {:.1}pt remaining; \
@@ -589,11 +622,6 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         // here too: it is atomic only while some page can honour that, and none
         // can. Nested-table cells and vMerge spans are structurally indivisible
         // and fall through to the overflow below.
-        let single_row_group = group.end - group.start == 1;
-        let row_has_nested_table = rows[group.start..group.end]
-            .iter()
-            .flat_map(|r| r.cells.iter())
-            .any(cell_has_nested_table);
         let fits_nowhere = !is_header
             && single_row_group
             && !row_has_nested_table
@@ -680,11 +708,22 @@ pub(crate) fn layout_table_paginated_with_page_heights(
 
         if group.height > remaining {
             log::warn!(
-                "[table] row group {}-{} ({:.1}pt) exceeds page height ({:.1}pt available)",
+                "[table] row group {}-{} ({:.1}pt) exceeds page height ({:.1}pt available) \
+                 [is_header={} header_count={} header_h={:.1} splittable={} single_row={} \
+                 nested_table={} next_page_h={:.1} next_remaining={:.1} page0_h={:.1}]",
                 group.start,
                 group.end,
                 group.height.raw(),
                 remaining.raw(),
+                is_header,
+                header_count,
+                header_height.raw(),
+                group.splittable,
+                single_row_group,
+                row_has_nested_table,
+                next_page_height.raw(),
+                next_remaining.raw(),
+                page_height_for_slice(0).raw(),
             );
         }
         current_slice.push(SliceItem::Range(group.start..group.end));
