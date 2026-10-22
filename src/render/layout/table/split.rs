@@ -36,10 +36,14 @@ pub(super) struct RowCutInput<'a> {
 enum CellCut {
     /// The cell is not cut: all its commands and lines stay on the first half.
     ///
-    /// Used for a cell that can't be cut text-wise — too few baselines, or
-    /// image/shape-only content — since you cannot cut through an image. The
-    /// caller adds the cell's full visible height to the row's required
-    /// first-half height instead of a partial one.
+    /// Two situations produce it, and they want the same thing. One is a cell
+    /// that can't be cut text-wise — too few baselines, or image/shape-only
+    /// content — since you cannot cut through an image. The other is a cell
+    /// whose whole content fits in the space this page has left: the row
+    /// splits for some *other* cell's sake, and cutting this one would push
+    /// content that already fits onto the next page. The caller adds the cell's
+    /// full visible height to the row's required first-half height instead of a
+    /// partial one.
     KeepAll,
     /// The cell is cut, at these thresholds.
     CutAt {
@@ -82,11 +86,16 @@ pub(super) struct SplitCut {
 /// bottom margins so the cut-edge border gets the natural padding Word
 /// preserves on split cells.
 ///
-/// Returns `None` in two cases: no cell has at least one line that fits
-/// within `available - margins.vertical()`, or every cell does but honoring
-/// the row's non-splittable cells' full visible height (see
-/// `CellCut::KeepAll`) would itself overflow `available` — in both cases
-/// the caller spills the whole row to the next page instead.
+/// Returns `None` in two cases, and the caller spills the whole row to the next
+/// page in both: no cell yields a cut at all — every cell either fits whole,
+/// offers no legal cut point, or has not even one line that fits in
+/// `available - margins.vertical()` — or honouring the kept-whole cells' full
+/// visible height would itself overflow `available`.
+///
+/// A cell whose whole content fits in `available` is kept whole and is *not*
+/// counted as a cut — see the note in `find_row_cut_inner`, which is what keeps
+/// a short cell beside a tall one from losing its last paragraph to the next
+/// page.
 pub(super) fn find_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
     find_row_cut_inner(input, false)
 }
@@ -101,6 +110,32 @@ fn find_row_cut_inner(input: &RowCutInput<'_>, relaxed: bool) -> Option<SplitCut
     let mut non_splittable_heights: Vec<Pt> = Vec::with_capacity(input.row.cells.len());
 
     for (entry, cell) in input.mr.entries.iter().zip(&input.row.cells) {
+        // A cell whose whole content fits above the cut keeps it whole.
+        //
+        // `cut_for_cell` can only ever answer with a cut *between* lines, so a
+        // short cell in a row that splits for some *other* cell's sake would be
+        // cut at its last legal boundary and lose its final line — or, in the
+        // shape that turns up in real documents, its final paragraph — to the
+        // continuation, even though all of it fitted. The row is tall because
+        // its neighbour is tall; this cell is not part of that problem.
+        //
+        // `KeepAll` is already exactly the right answer: `partition_commands`
+        // and `partition_lines` put everything on the first half and leave the
+        // continuation empty. Its full visible height still becomes a floor on
+        // the row's first half (below), and because that height is at most
+        // `available`, the floor can never overshoot the page.
+        //
+        // Deliberately *not* setting `any_fits`: `KeepAll` is not a cut. A row
+        // in which every cell fits — its height comes from `w:trHeight` or from
+        // a border charge rather than from content — must return `None` and be
+        // spilled whole, never "split" at a shift that shrinks nothing (see the
+        // termination note in `cut_for_cell`).
+        let required = entry.layout.content_height + cell.margins.top + cell.margins.bottom;
+        if required <= input.available {
+            cells.push(CellCut::KeepAll);
+            non_splittable_heights.push(required);
+            continue;
+        }
         match cut_for_cell(
             entry,
             cell.margins.top,
@@ -118,8 +153,6 @@ fn find_row_cut_inner(input: &RowCutInput<'_>, relaxed: bool) -> Option<SplitCut
             }
             None => {
                 cells.push(CellCut::KeepAll);
-                let required =
-                    entry.layout.content_height + cell.margins.top + cell.margins.bottom;
                 non_splittable_heights.push(required);
             }
         }
@@ -327,7 +360,17 @@ pub(super) fn split_row_at(mr: &MeasuredRow, cut: &SplitCut) -> SplitRow {
         second_entries.push(CellLayoutEntry {
             layout: crate::render::layout::cell::CellLayout {
                 commands: second_cmds,
-                content_height: (entry.layout.content_height - cc.shift()).max(Pt::ZERO),
+                // A kept-whole cell contributes nothing to the continuation —
+                // `partition_commands` / `partition_lines` leave it an empty
+                // command and line list. Carrying the original height over
+                // would be a floor on the *next* cut of this same row, so a
+                // continuation page shorter than the cell would refuse the cut
+                // and dump the rest of the row onto one page.
+                content_height: if matches!(cc, CellCut::KeepAll) {
+                    Pt::ZERO
+                } else {
+                    (entry.layout.content_height - cc.shift()).max(Pt::ZERO)
+                },
                 lines: second_lines,
             },
             cell_x: entry.cell_x,
@@ -1172,18 +1215,21 @@ mod tests {
         );
     }
 
-    /// [`CellCut::KeepAll`] in a row that also has a cell that *can* be cut.
+    /// [`CellCut::KeepAll`] in a row that also has a cell that *does* get cut.
     ///
-    /// §17.3.1.14 `keepLines` makes the second cell's only paragraph
-    /// internally atomic, so it exposes no legal cut and cannot be divided —
-    /// the same position an image-only cell is in, reached here without one.
-    /// Its whole visible height then becomes a floor on the row's first half:
-    /// 84pt, above the 56 the splittable cell asked for. Without that floor the
-    /// uncut cell's last two lines would be drawn past the cut edge, on top of
-    /// whatever follows the table.
+    /// The second cell is 84pt of `keepLines` content in a 90pt budget, so it
+    /// cannot be divided (§17.3.1.14 makes the paragraph internally atomic) *and*
+    /// does not need to be (it fits). Either way it is kept whole, and its full
+    /// visible height then becomes a floor on the row's first half: 84pt, above
+    /// the 80 the other cell asked for. Without that floor the kept-whole cell's
+    /// lines would be drawn past the cut edge, on top of whatever follows the
+    /// table.
     ///
-    /// The splittable cell still cuts at its own 56 — raising the floor must
-    /// not make the row keep everything.
+    /// The first cell is taller than the page *and* carries margins, so it
+    /// genuinely has to cut — raising the floor must not turn the row into one
+    /// that keeps everything (which is the other half of the rule: a cell whose
+    /// content fits is kept whole, so a row only ever splits while some cell
+    /// still has to).
     #[test]
     fn an_uncuttable_cell_raises_the_rows_first_half_to_its_own_full_height() {
         let keep_lines = ParagraphStyle {
@@ -1191,7 +1237,9 @@ mod tests {
             ..Default::default()
         };
         let rows = vec![row_of(vec![
-            cell_n_lines(6, 0.0, ParagraphStyle::default()),
+            // 168pt of content in 5pt margins: cannot fit 90pt, so it must cut.
+            cell_n_lines(12, 5.0, ParagraphStyle::default()),
+            // 84pt, atomic — kept whole, and its height floor is the row's.
             cell_n_lines(6, 0.0, keep_lines),
         ])];
         let measured = measure_cols(&rows, 2);
@@ -1207,7 +1255,7 @@ mod tests {
         assert_eq!(
             parts.first.height,
             Pt::new(84.0),
-            "the uncuttable cell's full six lines, not the 56 the other asked for"
+            "the uncuttable cell's full six lines, not the 80 the other asked for"
         );
         assert_eq!(
             texts(&parts.first.entries[1].layout.commands).len(),
@@ -1220,8 +1268,9 @@ mod tests {
         );
         assert_eq!(
             texts(&parts.first.entries[0].layout.commands),
-            vec!["L0 ", "L1 ", "L2 ", "L3 "],
-            "the splittable cell still cuts at its own legal point"
+            vec!["L0 ", "L1 ", "L2 ", "L3 ", "L4 "],
+            "the splittable cell still cuts at its own legal point: five lines \
+             in 90 − 2 × 5 = 80pt of budget"
         );
     }
 
@@ -1253,6 +1302,265 @@ mod tests {
             .is_none(),
             "the splittable cell fits, but the uncuttable one does not — and a \
              cut that overflows it is not a cut"
+        );
+    }
+
+    // ── A short cell beside a tall one (§17.4.6) ────────────────────────────
+    //
+    // The cut is per cell, so a cell that fits must not be cut merely because a
+    // neighbouring cell forced the row to split. The shape below is the one
+    // that made this visible in a real document: one tall cell spanning pages,
+    // and beside it a cell of two or three short paragraphs, the last of which
+    // was pushed to the next page although all of it fitted.
+
+    /// One cell holding `n` single-line paragraphs, each a legal cut boundary
+    /// against the next (nothing here sets `keepNext`).
+    fn cell_n_paragraphs(n: usize, margin: f32) -> TableCellInput {
+        TableCellInput {
+            blocks: (0..n)
+                .map(|i| LayoutBlock::Paragraph {
+                    fragments: vec![text_frag(&format!("P{i} "))],
+                    style: ParagraphStyle::default(),
+                    page_break_before: false,
+                    footnotes: vec![],
+                    floating_images: vec![],
+                    floating_shapes: vec![],
+                })
+                .collect(),
+            margins: PtEdgeInsets::new(
+                Pt::new(margin),
+                Pt::new(margin),
+                Pt::new(margin),
+                Pt::new(margin),
+            ),
+            grid_span: 1,
+            shading: None,
+            cell_borders: None,
+            vertical_merge: None,
+            vertical_align: CellVAlign::Top,
+        }
+    }
+
+    /// The tall cell splits (it has to — it is 280pt); the short one keeps all
+    /// three of its paragraphs on the first page.
+    ///
+    /// Without the "fits ⇒ KeepAll" rule the short cell is cut at its largest
+    /// legal boundary, which is *between its second and third paragraph* — so
+    /// the third paragraph lands on page 2 next to the tall cell's continuation,
+    /// even though 42pt had 98pt of room.
+    #[test]
+    fn a_short_cell_keeps_all_its_paragraphs_when_a_tall_cell_splits() {
+        let rows = vec![row_of(vec![
+            cell_n_lines(20, 0.0, ParagraphStyle::default()), // 280pt
+            cell_n_paragraphs(3, 0.0),                       // 42pt
+        ])];
+        let measured = measure_cols(&rows, 2);
+        assert_eq!(
+            measured.rows[0].height,
+            Pt::new(280.0),
+            "the row is the tall cell; the short one is nowhere near its height"
+        );
+
+        // 98pt of room: seven 14pt lines of the tall cell.
+        let cut = find_row_cut(&RowCutInput {
+            mr: &measured.rows[0],
+            row: &rows[0],
+            available: Pt::new(98.0),
+        })
+        .expect("the tall cell offers a legal cut within 98pt");
+        let parts = split_row_at(&measured.rows[0], &cut);
+
+        assert_eq!(
+            texts(&parts.first.entries[1].layout.commands),
+            vec!["P0 ", "P1 ", "P2 "],
+            "all three paragraphs fit, so no cut may take one of them away"
+        );
+        assert!(
+            texts(&parts.second.entries[1].layout.commands).is_empty(),
+            "…and the short cell contributes nothing to the continuation"
+        );
+        assert_eq!(
+            parts.second.entries[1].layout.content_height,
+            Pt::ZERO,
+            "the continuation of a kept-whole cell has no content left to place"
+        );
+
+        // The tall cell still splits as far as it legitimately can — the fix
+        // must not make the row keep everything.
+        assert_eq!(
+            texts(&parts.first.entries[0].layout.commands).len(),
+            7,
+            "the tall cell keeps its seven fitting lines"
+        );
+        assert_eq!(
+            texts(&parts.second.entries[0].layout.commands).len(),
+            13,
+            "…and the other thirteen continue"
+        );
+        assert_eq!(
+            parts.first.height,
+            Pt::new(98.0),
+            "the row's first half is the tall cell's cut, not the short cell's height"
+        );
+    }
+
+    /// A row whose cells all fit is not "cut" at all — even when the row itself
+    /// is taller than the space left, because then the height is the row's own
+    /// (`w:trHeight`) rather than content a cut could divide.
+    ///
+    /// This is the termination guard for the "fits ⇒ KeepAll" rule. With every
+    /// cell kept whole there is no cut, so the shift is 0 and the continuation
+    /// would be exactly as tall as the row — `mod.rs`'s re-split loop would then
+    /// spin forever rebuilding the same half. Declining here lets the caller
+    /// spill the row instead, which is the same answer it gives a row with no
+    /// legal cut at all.
+    #[test]
+    fn a_row_whose_cells_all_fit_is_never_cut_at_a_zero_shift() {
+        use super::super::types::RowHeightRule;
+
+        let mut row = row_n_lines(6, 0.0); // 84pt of content
+        row.height_rule = Some(RowHeightRule::AtLeast(Pt::new(200.0)));
+        let rows = vec![row];
+        let measured = measure(&rows);
+        assert_eq!(
+            measured.rows[0].height,
+            Pt::new(200.0),
+            "the rule owns the height here, not the content"
+        );
+
+        assert!(
+            find_row_cut(&RowCutInput {
+                mr: &measured.rows[0],
+                row: &rows[0],
+                available: Pt::new(100.0),
+            })
+            .is_none(),
+            "84pt of content fits in 100pt, so there is nothing left to divide"
+        );
+    }
+
+    /// The same row across several pages: every paragraph of the short cell is
+    /// on the first page, and the tall cell's continuation keeps splitting.
+    ///
+    /// This is what the real document asked for — a cell spanning pages beside
+    /// one that never needs to.
+    #[test]
+    fn a_multi_page_split_keeps_the_short_cell_on_the_first_page() {
+        use crate::render::layout::table::{
+            layout_table_paginated, TablePaginationConfig, TableSlice,
+        };
+
+        let rows = vec![row_of(vec![
+            cell_n_lines(40, 0.0, ParagraphStyle::default()), // 560pt
+            cell_n_paragraphs(3, 0.0),                       // 42pt
+        ])];
+
+        let slices = layout_table_paginated(
+            &rows,
+            &[Pt::new(40.0), Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(98.0),
+                page_height: Pt::new(98.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert!(
+            slices.len() >= 3,
+            "40 lines at seven lines a page cannot be one or two slices, got {}",
+            slices.len()
+        );
+
+        let paragraph = |slice: &TableSlice| {
+            slice
+                .commands
+                .iter()
+                .filter(|c| matches!(c, DrawCommand::Text { text, .. } if text.starts_with('P')))
+                .count()
+        };
+        assert_eq!(
+            paragraph(&slices[0]),
+            3,
+            "the short cell's three paragraphs all stay on page 1"
+        );
+        assert_eq!(
+            slices.iter().map(paragraph).sum::<usize>(),
+            3,
+            "…and none of them reappears on a continuation page"
+        );
+
+        let tall_lines: usize = slices
+            .iter()
+            .map(|slice| {
+                slice
+                    .commands
+                    .iter()
+                    .filter(|c| matches!(c, DrawCommand::Text { text, .. } if text.starts_with('L')))
+                    .count()
+            })
+            .sum();
+        assert_eq!(tall_lines, 40, "every line of the tall cell once");
+    }
+
+    /// A continuation page *shorter* than the kept-whole cell. The cell has
+    /// nothing left to place there, so its stale height must not be a floor:
+    /// doing that made the tall cell's next cut impossible (`find_row_cut`
+    /// returning `None`) and dumped the rest of the row onto one page.
+    #[test]
+    fn a_kept_whole_cell_does_not_block_the_next_cut_on_a_shorter_page() {
+        use crate::render::layout::table::{
+            layout_table_paginated_with_page_heights, TablePaginationHeights,
+        };
+
+        let rows = vec![row_of(vec![
+            cell_n_lines(40, 0.0, ParagraphStyle::default()), // 560pt
+            cell_n_paragraphs(4, 0.0),                       // 56pt, all on page 1
+        ])];
+
+        let slices = layout_table_paginated_with_page_heights(
+            &rows,
+            &[Pt::new(40.0), Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            TablePaginationHeights {
+                available_height: Pt::new(98.0),
+                suppress_first_row_top: false,
+                // Page 1 fits all seven lines *and* the short cell (98pt);
+                // every continuation page is 42pt — three lines, and less than
+                // the short cell's own 56pt height.
+                page_height_for_slice: |slice_index| {
+                    if slice_index == 0 {
+                        Pt::new(98.0)
+                    } else {
+                        Pt::new(42.0)
+                    }
+                },
+            },
+        );
+
+        for (i, slice) in slices.iter().enumerate() {
+            let limit = if i == 0 { 98.0 } else { 42.0 };
+            assert!(
+                slice.size.height.raw() <= limit + 0.01,
+                "slice {i} is {:.1}pt tall on a {limit}pt page — the continuation \
+                 was refused as a cut",
+                slice.size.height.raw()
+            );
+        }
+        assert_eq!(
+            slices
+                .iter()
+                .flat_map(|s| texts(&s.commands))
+                .filter(|t| t.starts_with('P'))
+                .count(),
+            4,
+            "the short cell's paragraphs appear exactly once each"
         );
     }
 

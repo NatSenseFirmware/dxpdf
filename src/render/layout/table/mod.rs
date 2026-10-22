@@ -154,6 +154,18 @@ impl SliceBuilder {
         carries_bottom: bool,
     ) -> TableSlice {
         let table_width = measured.table_width;
+        // A slice can hold no rows at all: the paginator emits one to express
+        // "this table declines to start on this page", which the caller turns
+        // into a page advance (see the header-row spill in
+        // `layout_table_paginated_with_page_heights`). It must carry no
+        // commands — a zero-height outline of a spaced table would otherwise
+        // paint degenerate rects on the very page the table is not on.
+        if self.cursor.placed.is_empty() {
+            return TableSlice {
+                commands: self.commands,
+                size: PtSize::new(table_width, Pt::ZERO),
+            };
+        }
         let height = self.cursor.y
             + if carries_bottom {
                 cell_spacing
@@ -246,13 +258,26 @@ pub fn layout_table(
 pub struct TablePaginationConfig {
     /// Available height on the first page.
     pub available_height: Pt,
-    /// Full page height for continuation pages.
+    /// Usable body height of every continuation page — the space between the
+    /// header slot and the footer slot, **not** `w:pgSz`. Callers that hold a
+    /// page size must subtract the top and bottom margins (and a footer taller
+    /// than the bottom margin) before passing it here; this function uses it as
+    /// the page bottom as-is.
     pub page_height: Pt,
     /// Whether to suppress the first row's top border (adjacent table collapse).
     pub suppress_first_row_top: bool,
 }
 
 pub(crate) struct TablePaginationHeights<F> {
+    /// Space from the cursor down to the page's **body** bottom — `w:pgSz` net
+    /// of `w:pgMar`'s top and bottom *and* of a footer taller than the bottom
+    /// margin, which is what `PageBodyBounds` already is.
+    ///
+    /// Reduced by the caller (`section::layout`'s `state.bottom - cursor_y`),
+    /// so nothing below this point subtracts a page margin again. Subtracting
+    /// one here a second time would pull every row up by the bottom margin
+    /// (and by the footer's height on top of that) and leave the lower band of
+    /// every page empty.
     pub(crate) available_height: Pt,
     pub(crate) suppress_first_row_top: bool,
     pub(crate) page_height_for_slice: F,
@@ -298,6 +323,12 @@ pub fn layout_table_paginated(
 /// fixed page height — continuation pages can have different header/footer
 /// clearance than the first, so the height available to a row varies by which
 /// page it lands on.
+///
+/// Both `available_height` and every value `page_height_for_slice` returns are
+/// **body** heights: the space between the header slot's bottom and the footer
+/// slot's top. The physical page, `w:pgMar`'s bottom margin and the footer are
+/// already out of them, so the fitting decisions in here compare a row against
+/// the real page bottom directly and must not subtract a margin of their own.
 pub(crate) fn layout_table_paginated_with_page_heights(
     rows: &[TableRowInput],
     col_widths: &[Pt],
@@ -457,12 +488,17 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 current_slice.push(SliceItem::Range(group.start..group.end));
                 remaining -= group.height;
                 continue;
-            } else {
-            // ❌ 下一頁放不下整組：開新頁，group放回緩衝，下一輪在新頁做split
+            } else if next_page_remaining > remaining {
+                // ❌ 下一頁放不下整組，但比這裡寬裕：開新頁，group放回緩衝，
+                // 下一輪在新頁做split
                 log::debug!(
-                    "[table-paginate] group {}-{} cannot fit fully on next page. flip page, reprocess group on new page for split",
+                    "[table-paginate] group {}-{} cannot fit fully on next page, but \
+                     next_remaining={:.1} > remaining={:.1}: flip page, reprocess \
+                     group on new page for split",
                     group.start,
-                    group.end
+                    group.end,
+                    next_page_remaining.raw(),
+                    remaining.raw()
                 );
                 slices.push(std::mem::take(&mut current_slice));
                 remaining = page_height_for_slice(slices.len());
@@ -473,6 +509,24 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 // 重點：把當前 group 放回緩衝，下一輪 loop 會重新讀取
                 buffered = Some(group);
                 continue;
+            } else {
+                // Flipping cannot gain anything: the fresh page's post-header
+                // room is no larger than the space left here (a header run that
+                // fills the page, or a page no taller than the header itself).
+                // Advancing anyway re-buffers the same group onto a page that is
+                // no roomier, and the next iteration reaches this same branch
+                // with a new empty slice pushed — a page per iteration, forever.
+                // Falling through keeps the loop monotone: the split, spill and
+                // force-fit paths below all place rows on *this* page, so one of
+                // them always makes progress.
+                log::debug!(
+                    "[table-paginate] group {}-{} cannot be helped by a page flip \
+                     (next_remaining={:.1} <= remaining={:.1}); keep it on this page",
+                    group.start,
+                    group.end,
+                    next_page_remaining.raw(),
+                    remaining.raw()
+                );
             }
         }
         // ========== 新增保護區邏輯結束，往下走原有拆分邏輯 ==========
@@ -567,6 +621,16 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         // offers no legal cut. §17.4.6 forbids a *cut*, not a *move*, so the first
         // remedy is the next page: whenever a fresh page holds the whole group, it
         // is moved there rather than overflowing the current one.
+        //
+        // §17.4.49 applies to that decision too. The header run is atomic — the
+        // split path above refuses it, correctly — but it is still a row group,
+        // and a header row arriving with too little room above the page's bottom
+        // must move to the next page like any other group. Excluding headers here
+        // left them with no path but the force-fit at the end of this loop, which
+        // paints the header *past* the page bottom (over the footer) and pushes
+        // `remaining` negative, so every row after it inherits the overflow.
+        // `next_remaining` is the fresh page's body height, net of its header
+        // repetition and of the footer slot already.
         let next_page_height = page_height_for_slice(slices.len() + 1);
         let next_remaining = if !is_header && header_count > 0 {
             next_page_height - header_height
@@ -595,7 +659,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             row_has_nested_table,
             page_height_for_slice(0).raw(),
         );
-        if !is_header && group.height <= next_remaining {
+        if group.height <= next_remaining {
             log::debug!(
                 "[table-paginate] group {}-{} does not fit in {:.1}pt remaining; \
                  moving whole to next page",
@@ -605,7 +669,12 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             );
             slices.push(std::mem::take(&mut current_slice));
             remaining = page_height_for_slice(slices.len());
-            if header_count > 0 {
+            // §17.4.49: the repeating header run is re-emitted above the group
+            // only when the group sits *past* the headers. Advancing because a
+            // header row itself did not fit is not that case — that row is part
+            // of the table's first appearance, so prepending the run would
+            // duplicate the header rows already emitted above it.
+            if !is_header && header_count > 0 {
                 current_slice.push(SliceItem::Range(0..header_count));
                 remaining -= header_height;
             }
@@ -706,6 +775,11 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             }
         }
 
+        // Reaching here means the group fits no page: the spill above declined
+        // because `group.height > next_remaining`, i.e. a group taller than the
+        // body box itself (a header run taller than a page, an unsplittable
+        // image cell, a vMerge span). Overflowing is then the only option left,
+        // and the warning says by how much.
         if group.height > remaining {
             log::warn!(
                 "[table] row group {}-{} ({:.1}pt) exceeds page height ({:.1}pt available) \
@@ -2230,6 +2304,122 @@ mod tests {
             .count();
         assert_eq!(count0, 0, "first slice empty when no space available");
         assert_eq!(count1, 2, "all content moves to continuation");
+    }
+
+    /// §17.4.49: a header row is atomic — never split — but it is still a row
+    /// group, so the page-bottom test applies to it: it moves to the next page
+    /// rather than being painted past the bottom of this one.
+    ///
+    /// `available_height` is the space down to the page's *body* bottom (the
+    /// footer's top), which the caller has already reduced by `w:pgMar` and the
+    /// footer slot. A 28pt header arriving with 20pt left therefore fits
+    /// nowhere on this page; the whole table starts on the next one.
+    ///
+    /// Before the fix the header had no path but the end-of-loop force-fit, so
+    /// the single slice was 28pt tall inside a 20pt budget — 8pt painted over
+    /// the footer — and every row after it inherited the deficit.
+    #[test]
+    fn header_row_that_does_not_fit_is_moved_not_painted_past_the_page_bottom() {
+        let mut header = tall_row(2); // 28pt
+        header.is_header = Some(true);
+        header.cant_split = Some(true);
+        let body = tall_row(2); // 28pt
+
+        let rows = vec![header, body];
+        let col_widths = vec![Pt::new(40.0)];
+
+        let slices = layout_table_paginated(
+            &rows,
+            &col_widths,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(20.0), // less than the header alone
+                page_height: Pt::new(200.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert_eq!(
+            slices.len(),
+            2,
+            "the table must decline the 20pt this page has left and start fresh"
+        );
+        assert_eq!(
+            slices[0].size.height,
+            Pt::ZERO,
+            "the declined page carries nothing, so nothing of the table may be \
+             drawn below its 20pt of remaining space: {:?}",
+            slices[0].size
+        );
+        assert!(
+            slices[0].commands.is_empty(),
+            "a declined page must emit no commands at all"
+        );
+
+        let header_text = slices[1]
+            .commands
+            .iter()
+            .filter(|c| matches!(c, DrawCommand::Text { .. }))
+            .count();
+        assert_eq!(
+            header_text, 4,
+            "the fresh page holds header (2 lines) + body (2 lines) exactly once"
+        );
+    }
+
+    /// The same move, but for the *second* row of a two-row header run: the
+    /// rows already placed must not be duplicated by the §17.4.49 repetition
+    /// that normally tops up a continuation slice.
+    #[test]
+    fn a_moved_header_row_does_not_duplicate_the_run_above_it() {
+        let mut h0 = tall_row(1); // 14pt
+        h0.is_header = Some(true);
+        h0.cant_split = Some(true);
+        let mut h1 = tall_row(1); // 14pt
+        h1.is_header = Some(true);
+        h1.cant_split = Some(true);
+        let body = tall_row(2); // 28pt
+
+        let rows = vec![h0, h1, body];
+        let col_widths = vec![Pt::new(40.0)];
+
+        // 20pt: h0 fits (14), h1 does not (6 left).
+        let slices = layout_table_paginated(
+            &rows,
+            &col_widths,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(20.0),
+                page_height: Pt::new(200.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert_eq!(slices.len(), 2, "h1 spills to a second slice");
+        let count = |slice: &TableSlice| {
+            slice
+                .commands
+                .iter()
+                .filter(|c| matches!(c, DrawCommand::Text { .. }))
+                .count()
+        };
+        assert_eq!(count(&slices[0]), 1, "slice 0 is h0 alone");
+        assert_eq!(
+            count(&slices[1]),
+            3,
+            "slice 1 is h1 + body — repeating h0 above it would duplicate the run"
+        );
+        let total: usize = slices.iter().map(count).sum();
+        assert_eq!(
+            total, 4,
+            "every row is drawn exactly once across the two slices"
+        );
     }
 
     /// Regression: when a non-header row triggers a page break, header rows
